@@ -1,0 +1,277 @@
+Index: diam/message.go
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- diam/message.go	(revision 9ea0b9498e1ada9abb23c6519dfae5b19202fcb9)
++++ diam/message.go	(date 1600000651918)
+@@ -36,6 +36,11 @@
+ 	stream     uint // the stream this message was received on (if any)
+ }
+
++type MessageWithError struct {
++	message *Message
++	err     error
++}
++
+ var readerBufferPool sync.Pool
+
+ func newReaderBuffer() *bytes.Buffer {
+@@ -60,70 +65,82 @@
+ 	return make([]byte, l)
+ }
+
+-// ReadMessage reads a binary stream from the reader and uses the given
++// startReadingMessage reads a binary stream from the reader and uses the given
+ // dictionary to parse it.
+-func ReadMessage(reader io.Reader, dictionary *dict.Parser) (*Message, error) {
+-	buf := newReaderBuffer()
+-	defer putReaderBuffer(buf)
+-	m := &Message{dictionary: dictionary}
+-	cmd, stream, err := m.readHeader(reader, buf)
+-	if err != nil {
+-		return nil, err
+-	}
+-	m.stream = stream
+-	if err = m.readBody(reader, buf, cmd, stream); err != nil {
+-		return nil, err
+-	}
+-	return m, nil
+-}
++func startReadingMessage(reader io.Reader, dictionary *dict.Parser, messageChan chan *MessageWithError) {
++	var err error
++	var n int
++	var stream uint
++	readBuf := make([]byte, MessageBufferLength)
++	messageBuf := bytes.NewBuffer(make([]byte, 0, 20*MessageBufferLength))
+
+-// MessageStream returns the stream #, the message was received on (when applicable)
+-func (m *Message) MessageStream() uint {
+-	return m.stream
+-}
+-
+-func (m *Message) readHeader(r io.Reader, buf *bytes.Buffer) (cmd *dict.Command, stream uint, err error) {
+-	b := buf.Bytes()[:HeaderLength]
+-	msr, isMulti := r.(MultistreamReader)
+-	if isMulti {
+-		_, stream, err = msr.ReadAtLeast(b, HeaderLength, InvalidStreamID)
+-		if err == nil {
+-			msr.SetCurrentStream(stream)
+-		}
+-	} else {
+-		_, err = io.ReadFull(r, b)
+-	}
+-	if err != nil {
+-		return nil, stream, err
++	for {
++		msr, isMulti := reader.(MultistreamReader)
++		if isMulti {
++			_, stream, err = msr.ReadAtLeast(readBuf, HeaderLength, InvalidStreamID)
++			if err == nil {
++				msr.SetCurrentStream(stream)
++			}
++		} else {
++			n, err = reader.Read(readBuf)
++			if err != nil && err == io.EOF {
++				continue
++			}
++		}
++		if err != nil {
++			break
++		}
++		_, err = messageBuf.Write(readBuf[:n])
++		if err != nil {
++			break
++		}
++
++		ReadMessages(messageBuf, dictionary, messageChan)
+ 	}
+-	m.Header, err = DecodeHeader(b)
++}
++
++func ReadMessages(messageBuf *bytes.Buffer, dictionary *dict.Parser, messageChan chan *MessageWithError) {
++	for messageBuf.Len() >= HeaderLength {
++		m := &Message{dictionary: dictionary}
++		cmd, err := m.readHeader(messageBuf)
++		if err != nil || int(m.Header.MessageLength) > messageBuf.Len() {
++			break
++		}
++
++		if err = m.readBody(messageBuf, cmd); err != nil {
++			break
++		}
++
++		messageChan <- &MessageWithError{
++			message: m,
++			err:     err,
++		}
++	}
++}
++
++// MessageStream returns the stream #, the message was received on (when applicable)
++func (m *Message) MessageStream() uint {
++	return m.stream
++}
++
++func (m *Message) readHeader(buf *bytes.Buffer) (cmd *dict.Command, err error) {
++	m.Header, err = DecodeHeader(buf.Bytes()[:HeaderLength])
+ 	if err != nil {
+-		return nil, stream, err
++		return nil, err
+ 	}
+ 	cmd, err = m.Dictionary().FindCommand(
+ 		m.Header.ApplicationID,
+ 		m.Header.CommandCode,
+ 	)
+ 	if err != nil {
+-		return nil, stream, err
++		return nil, err
+ 	}
+-	return cmd, stream, nil
++	return cmd, nil
+ }
+
+-func (m *Message) readBody(r io.Reader, buf *bytes.Buffer, cmd *dict.Command, stream uint) error {
++func (m *Message) readBody(buf *bytes.Buffer, cmd *dict.Command) error {
+ 	var err error
+-	var n int
+-	b := readerBufferSlice(buf, int(m.Header.MessageLength-HeaderLength))
+-	msr, isMulti := r.(MultistreamReader)
+-	if isMulti {
+-		n, _, err = msr.ReadAtLeast(b, len(b), stream)
+-	} else {
+-		n, err = io.ReadFull(r, b)
+-	}
+-	if err != nil {
+-		return fmt.Errorf("readBody Error: %v, %d bytes read", err, n)
+-	}
+-	n = m.maxAVPsFor(cmd)
++	n := m.maxAVPsFor(cmd)
+ 	if n == 0 {
+ 		// TODO: fail to load the dictionary instead.
+ 		return fmt.Errorf(
+@@ -132,7 +149,20 @@
+ 	}
+ 	// Pre-allocate max # of AVPs for this message.
+ 	m.AVP = make([]*AVP, 0, n)
+-	if err = m.decodeAVPs(b); err != nil {
++
++	b := buf.Next(int(m.Header.MessageLength))[HeaderLength:]
++
++	// this can fix the bug too but i don't know why
++	//buf.Write([]byte{1})
++	//if &buf.Next(1)[0] == &b[0] {
++	//	panic("something bad!!!")
++	//}
++
++	data := make([]byte, len(b))
++	// this copy fixes the race
++	copy(data, b)
++
++	if err = m.decodeAVPs(data); err != nil {
+ 		return err
+ 	}
+ 	return nil
+@@ -574,4 +604,4 @@
+ 		s += "\t"
+ 	}
+ 	return s
+-}
++}
+\ No newline at end of file
+Index: diam/server.go
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- diam/server.go	(revision 9ea0b9498e1ada9abb23c6519dfae5b19202fcb9)
++++ diam/server.go	(date 1599998839777)
+@@ -157,24 +157,6 @@
+ 	return c, nil
+ }
+
+-// Read next message from connection.
+-func (c *conn) readMessage() (m *Message, err error) {
+-	if c.server.ReadTimeout > 0 {
+-		c.rwc.SetReadDeadline(time.Now().Add(c.server.ReadTimeout))
+-	}
+-	if msc, isMulti := c.rwc.(MultistreamConn); isMulti {
+-		// If it's a multi-stream association - reset the stream to "undefined" prior to reading next message
+-		msc.ResetCurrentStream()
+-		m, err = ReadMessage(msc, c.dictionary()) // MultistreamConn has it's own buffering
+-	} else {
+-		m, err = ReadMessage(c.buf.Reader, c.dictionary())
+-	}
+-	if err != nil {
+-		return nil, err
+-	}
+-	return m, nil
+-}
+-
+ // Serve a new connection.
+ func (c *conn) serve() {
+ 	defer func() {
+@@ -193,8 +175,22 @@
+ 		c.tlsState = &tls.ConnectionState{}
+ 		*c.tlsState = tlsConn.ConnectionState()
+ 	}
+-	for {
+-		m, err := c.readMessage()
++
++	messageChan := make(chan *MessageWithError, 20)
++
++	if c.server.ReadTimeout > 0 {
++		c.rwc.SetReadDeadline(time.Now().Add(c.server.ReadTimeout))
++	}
++	if msc, isMulti := c.rwc.(MultistreamConn); isMulti {
++		// If it's a multi-stream association - reset the stream to "undefined" prior to reading next message
++		msc.ResetCurrentStream()
++		go startReadingMessage(msc, c.dictionary(), messageChan) // MultistreamConn has it's own buffering
++	} else {
++		go startReadingMessage(c.buf.Reader, c.dictionary(), messageChan)
++	}
++
++	for m := range messageChan {
++		err := m.err
+ 		if err != nil {
+ 			c.rwc.Close()
+ 			// Report errors to the channel, except EOF.
+@@ -204,13 +200,12 @@
+ 					h = DefaultServeMux
+ 				}
+ 				if er, ok := h.(ErrorReporter); ok {
+-					er.Error(&ErrorReport{c.writer, m, err})
++					er.Error(&ErrorReport{c.writer, nil, err})
+ 				}
+ 			}
+ 			break
+ 		}
+-		// Handle messages in this goroutine.
+-		serverHandler{c.server}.ServeDIAM(c.writer, m)
++		serverHandler{c.server}.ServeDIAM(c.writer, m.message)
+ 	}
+ }
+
+@@ -473,6 +468,7 @@
+ 		entry.h.ServeDIAM(c, m)
+ 		return
+ 	}
++
+ 	mux.Error(&ErrorReport{
+ 		Conn:    c,
+ 		Message: m,
+@@ -492,6 +488,7 @@
+ 		entry.h.ServeDIAM(c, m)
+ 		return
+ 	}
++
+ 	mux.Error(&ErrorReport{
+ 		Conn:    c,
+ 		Message: m,
+@@ -579,6 +576,7 @@
+ 	if handler == nil {
+ 		handler = DefaultServeMux
+ 	}
++
+ 	handler.ServeDIAM(w, m)
+ }
